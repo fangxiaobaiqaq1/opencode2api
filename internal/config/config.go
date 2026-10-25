@@ -81,6 +81,17 @@ type WarpConfig struct {
 	// replacement exit a new public egress; without it, exits share one
 	// address and an egress-scoped free quota stays exhausted.
 	SourceIPv6 string `json:"source_ipv6,omitempty"`
+	// Warm (fork) keeps at least this many exits registered and hot even when
+	// idle, so a burst draws from a ready ring instead of waiting for
+	// registrations. 0 keeps the upstream demand-driven sizing.
+	Warm int `json:"warm,omitempty"`
+	// RefillParallel (fork) is how many exits register concurrently while the
+	// ring is below target. Upstream registers one at a time. 0 means 1.
+	RefillParallel int `json:"refill_parallel,omitempty"`
+	// RegisterGapMs (fork) overrides the pause between two registrations.
+	// Upstream uses 12000; Cloudflare's /reg did not throttle 26 back-to-back
+	// registrations in testing (2026-10-26). 0 keeps 12000.
+	RegisterGapMs int `json:"register_gap_ms,omitempty"`
 }
 
 // Normalize fills the defaults and canonicalizes the stack name.
@@ -96,8 +107,11 @@ func (w *WarpConfig) Normalize() error {
 		return fmt.Errorf("warp.stack: %w", err)
 	}
 	w.Stack = string(stack)
-	if w.PoolSize < 1 || w.PoolSize > 32 {
-		return errors.New("warp.pool_size must be between 1 and 32")
+	if w.PoolSize < 1 || w.PoolSize > 1024 {
+		return errors.New("warp.pool_size must be between 1 and 1024")
+	}
+	if w.Warm < 0 || w.Warm > w.PoolSize || w.RefillParallel < 0 || w.RefillParallel > 64 || w.RegisterGapMs < 0 {
+		return errors.New("warp.warm must be 0..pool_size, warp.refill_parallel 0..64, warp.register_gap_ms >= 0")
 	}
 	w.SourceIPv6 = strings.TrimSpace(w.SourceIPv6)
 	if w.SourceIPv6 != "" {

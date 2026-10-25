@@ -70,10 +70,17 @@ func newRegistrar() *registrar {
 }
 
 func (r *registrar) register(ctx context.Context) (registration, error) {
+	// Fork: the lock only reserves a start slot minGap after the previous one;
+	// the API calls run outside it, so registrations can overlap (upstream
+	// held the lock for the whole exchange, serializing them).
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if wait := r.minGap - time.Since(r.lastReg); wait > 0 {
+	slot := r.lastReg.Add(r.minGap)
+	if now := time.Now(); slot.Before(now) {
+		slot = now
+	}
+	r.lastReg = slot
+	r.mu.Unlock()
+	if wait := time.Until(slot); wait > 0 {
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
 		select {
@@ -82,7 +89,6 @@ func (r *registrar) register(ctx context.Context) (registration, error) {
 		case <-timer.C:
 		}
 	}
-	r.lastReg = time.Now()
 
 	privateKey, publicKey, err := wireGuardKeypair()
 	if err != nil {

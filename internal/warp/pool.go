@@ -85,10 +85,11 @@ type Pool struct {
 	cooling   map[string]time.Time
 	changed   chan struct{}
 	closed    bool
-	refilling bool
+	refilling int // registrations in flight (fork: up to parallel)
 	scaling   bool
+	warm      int // fork: minimum hot exits while idle
+	parallel  int // fork: concurrent registrations
 	wait      sync.WaitGroup
-	createMu  sync.Mutex
 }
 
 type Lease struct {
@@ -124,6 +125,12 @@ type Options struct {
 	// replacement reaches Cloudflare from a new source and receives a new
 	// public egress — the only way past an egress-scoped free usage limit.
 	SourceIPv6 netip.Prefix
+	// Warm keeps at least this many exits hot while idle (fork).
+	Warm int
+	// RefillParallel registers this many exits concurrently (fork). 0 = 1.
+	RefillParallel int
+	// RegisterGap overrides the pause between registrations (fork). 0 = 12s.
+	RegisterGap time.Duration
 }
 
 // NewWithOptions creates a WARP pool whose exits use the selected IP stack and,
@@ -141,6 +148,9 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 		size = DefaultPoolSize
 	}
 	r := newRegistrar()
+	if opts.RegisterGap > 0 {
+		r.minGap = opts.RegisterGap
+	}
 	pool, err := newPool(ctx, slogLogger{log: log}, size, func(ctx context.Context) (*exit, error) {
 		reg, err := r.register(ctx)
 		if err != nil {
@@ -159,6 +169,11 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 		return nil, err
 	}
 	pool.stack = normalized
+	pool.mu.Lock()
+	pool.warm = min(opts.Warm, size)
+	pool.parallel = max(opts.RefillParallel, 1)
+	pool.mu.Unlock()
+	pool.startRefill()
 	return pool, nil
 }
 
@@ -226,6 +241,9 @@ func (p *Pool) desiredLocked() int {
 	want := p.inflight + p.waiting + 1
 	if want < 2 {
 		want = 2
+	}
+	if want < p.warm {
+		want = p.warm
 	}
 	if want > p.size {
 		want = p.size
@@ -417,16 +435,16 @@ func (p *Pool) replace(old *exit, reason string) {
 
 func (p *Pool) refill() {
 	p.mu.Lock()
-	if p.closed || p.refilling || !p.needsRefillLocked() {
+	if p.closed || !p.refillSlotLocked() {
 		p.mu.Unlock()
 		return
 	}
-	p.refilling = true
+	p.refilling++
 	p.mu.Unlock()
 
 	replacement, err := p.createExit(p.ctx)
 	p.mu.Lock()
-	p.refilling = false
+	p.refilling--
 	placed := false
 	if err == nil && !p.closed && len(p.active) < p.size {
 		p.active = append(p.active, replacement)
@@ -456,16 +474,32 @@ func (p *Pool) refill() {
 
 func (p *Pool) startRefill() {
 	p.mu.Lock()
-	if p.closed || p.refilling || !p.needsRefillLocked() {
+	if p.closed {
 		p.mu.Unlock()
 		return
 	}
-	p.wait.Add(1)
+	// Fork: start as many concurrent registrations as the deficit needs, up to
+	// parallel; refill re-checks the slot under the lock.
+	n := min(p.desiredLocked()-len(p.active)-p.refilling, max(p.parallel, 1)-p.refilling)
+	if n <= 0 {
+		p.mu.Unlock()
+		return
+	}
+	p.wait.Add(n)
 	p.mu.Unlock()
-	go func() {
-		defer p.wait.Done()
-		p.refill()
-	}()
+	for range n {
+		go func() {
+			defer p.wait.Done()
+			p.refill()
+		}()
+	}
+}
+
+// refillSlotLocked reports whether another registration may start: the ring
+// (plus registrations already in flight) is under target and a parallel slot
+// is free.
+func (p *Pool) refillSlotLocked() bool {
+	return p.refilling < max(p.parallel, 1) && len(p.active)+p.refilling < p.desiredLocked()
 }
 
 // released records that a lease was returned and trims the ring back toward
@@ -548,8 +582,6 @@ func (p *Pool) after(delay time.Duration, fn func()) {
 }
 
 func (p *Pool) createExit(ctx context.Context) (*exit, error) {
-	p.createMu.Lock()
-	defer p.createMu.Unlock()
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		p.mu.Lock()
