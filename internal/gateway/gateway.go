@@ -92,6 +92,9 @@ type Gateway struct {
 	// freeTierBlock is how long an exit the free tier flagged stays out of the
 	// anonymous cursor. Zero uses freeTierBlockTTL.
 	freeTierBlock time.Duration
+	// exitQuotaPath persists the per-exit daily-quota cooldowns and the last
+	// exit probe (see exitquota.go). Empty keeps them in memory only.
+	exitQuotaPath string
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -118,6 +121,8 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	if err != nil {
 		return nil, fmt.Errorf("go node pool: %w", err)
 	}
+	anonymous := anonymousPool(cfg.Anonymous, transports, cooldown, anonymousBackoffFromConfig(cfg.Models.AnonymousBackoff))
+	anonymous.quotaStrikes = cfg.Performance.QuotaStrikes
 	catalog := models.Catalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
@@ -128,7 +133,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		transports:     transports,
 		zenNodes:       zenNodes,
 		goNodes:        goNodes,
-		anonymous:      anonymousPool(cfg.Anonymous, transports, cooldown, anonymousBackoffFromConfig(cfg.Models.AnonymousBackoff)),
+		anonymous:      anonymous,
 		warp:           warpPool,
 		catalog:        catalog,
 		monitor:        monitor,

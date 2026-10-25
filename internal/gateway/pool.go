@@ -82,6 +82,46 @@ type anonymousNodes struct {
 	breakerStrikes atomic.Int32
 	consecutive    atomic.Int32
 	probing        atomic.Bool
+	// quotaStrikes>0 switches 429 handling to OpenCode's real per-IP-per-UTC-day
+	// model: after this many consecutive FreeUsageLimit 429s a static exit is
+	// cooled until the next UTC midnight instead of the short exponential
+	// backoff. 0 keeps the upstream behavior.
+	quotaStrikes int
+}
+
+// utcMidnightDelay is the time until the next UTC midnight plus a one-minute
+// skew margin. OpenCode's free quota key is ip+YYYYMMDD(UTC), so a
+// FreeUsageLimit exit cannot recover before the day rolls over.
+func utcMidnightDelay(now time.Time) time.Duration {
+	return now.UTC().Truncate(24 * time.Hour).Add(24*time.Hour + time.Minute).Sub(now)
+}
+
+// MarkQuotaExhausted records a FreeUsageLimit 429 on node. With quotaStrikes
+// enabled it cools the exit until the next UTC midnight once the strikes reach
+// the threshold; #pool exits are never cooled (the next request draws a fresh
+// IP). It reports whether the exit was cooled. Without the feature it falls
+// back to the ordinary failure cooldown.
+func (p *anonymousNodes) MarkQuotaExhausted(node *anonymousNode, immediate bool) bool {
+	if node == nil {
+		return false
+	}
+	if p.quotaStrikes <= 0 || (node.proxy != nil && node.proxy.pool) {
+		p.MarkFailure(node, nil, errQuotaExhausted)
+		return false
+	}
+	node.verified.Store(false)
+	if node.quotaStrikes.Add(1) < int32(p.quotaStrikes) && !immediate {
+		// A single stray 429 must not demote an exit for a whole day, but the
+		// short failure cooldown still keeps the next requests (which share a
+		// session-affinity start, see CursorFor) off it for a while.
+		p.MarkFailure(node, nil, errQuotaExhausted)
+		return false
+	}
+	// Pin the strikes at the threshold: it marks the cooldown as a quota
+	// cooldown (persisted, see exitquota.go) rather than a short failure one.
+	node.quotaStrikes.Store(int32(p.quotaStrikes))
+	node.cooldownUntil.Store(time.Now().Add(utcMidnightDelay(time.Now())).UnixNano())
+	return true
 }
 
 type anonymousBackoff struct {
@@ -94,6 +134,15 @@ type anonymousNode struct {
 	proxy         *proxyTransport
 	failures      atomic.Uint32
 	cooldownUntil atomic.Int64
+	// quotaStrikes counts consecutive FreeUsageLimit 429s on this exit; a 2xx
+	// clears it. When it reaches anonymousNodes.quotaStrikes the exit is cooled
+	// until the next UTC midnight (OpenCode's per-IP daily quota reset).
+	quotaStrikes atomic.Int32
+	// verified marks an exit whose last answer was a 2xx (user traffic or the
+	// exit probe). With quota_strikes enabled the cursor tries these first, so
+	// a request does not walk exhausted or dead exits while known-good ones
+	// sit idle.
+	verified atomic.Bool
 }
 
 // anonymousCursor walks the anonymous nodes for one request from start;
@@ -294,6 +343,18 @@ func (c *anonymousCursor) Next() *anonymousNode {
 	isBlocked := func(node *anonymousNode) bool {
 		return node.proxy != nil && node.proxy.blockedUntil.Load() > now
 	}
+	if c.pool.quotaStrikes > 0 {
+		// Fork: verified exits first, rotating from this cursor's start.
+		for step := range n {
+			idx := (c.start + step) % n
+			node := c.pool.nodes[idx]
+			if !c.used[idx] && node.verified.Load() && !node.proxy.pool && !isBlocked(node) &&
+				node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now {
+				c.used[idx] = true
+				return node
+			}
+		}
+	}
 	for c.offset < n {
 		idx := (c.start + c.offset) % n
 		c.offset++
@@ -350,7 +411,9 @@ func (p *anonymousNodes) MarkSuccess(node *anonymousNode) {
 		return
 	}
 	node.failures.Store(0)
+	node.quotaStrikes.Store(0)
 	node.cooldownUntil.Store(0)
+	node.verified.Store(true)
 }
 
 // RestoreProxy clears cooldowns for anonymous nodes bound to a recovered
@@ -399,6 +462,7 @@ func (p *anonymousNodes) MarkFailure(node *anonymousNode, resp *http.Response, e
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 		return
 	}
+	node.verified.Store(false)
 	failures := node.failures.Add(1)
 	delay := p.cooldown * time.Duration(1<<min(failures-1, 3))
 	if resp != nil {

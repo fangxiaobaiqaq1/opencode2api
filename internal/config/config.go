@@ -248,6 +248,18 @@ type PerformanceConfig struct {
 	// abusive stays out of the anonymous cursor. Upstream does not publish
 	// the block duration, so the default is a conservative 15 minutes.
 	FreeTierBlockSeconds int `json:"free_tier_block_seconds"`
+	// QuotaStrikes switches the anonymous lane to OpenCode's real free quota
+	// model: the allowance is counted per egress IP per UTC day and resets at
+	// UTC midnight (console ipRateLimiter: key ip+YYYYMMDD, retryAfter = time to
+	// midnight). After this many consecutive FreeUsageLimit 429s from user
+	// traffic a static exit is cooled until the next UTC midnight instead of
+	// the short exponential backoff. 0 keeps the upstream behavior.
+	QuotaStrikes int `json:"quota_strikes,omitempty"`
+	// ExitProbeHours sends one real minimal request through every static
+	// anonymous exit this often (each costs one unit of that exit's daily
+	// allowance) so the quota state is measured instead of guessed. A probe
+	// FreeUsageLimit 429 cools the exit until UTC midnight at once. 0 disables.
+	ExitProbeHours int `json:"exit_probe_hours,omitempty"`
 }
 
 // AttemptTimeout returns the bound for a single upstream attempt. When
@@ -384,6 +396,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.FreeTierBlockSeconds < 0 {
 		return Config{}, errors.New("performance.free_tier_block_seconds must not be negative (0 uses the built-in cool-down)")
+	}
+	if cfg.Performance.QuotaStrikes < 0 || cfg.Performance.ExitProbeHours < 0 {
+		return Config{}, errors.New("performance.quota_strikes and performance.exit_probe_hours must not be negative (0 disables)")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")

@@ -209,6 +209,10 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 	if current := m.current.Load(); current != nil && current.config.Upstream.Zen == cfg.Upstream.Zen {
 		availability = current.availability
 	}
+	if m.configPath != "" {
+		gateway.exitQuotaPath = m.configPath + ".exitquota.json"
+		gateway.loadExitQuota()
+	}
 	gateway.catalog.SetPricingStore(m.metadata)
 	gateway.catalog.SetAvailabilityStore(availability)
 	gateway.availability = availability
@@ -260,6 +264,7 @@ func (m *RuntimeController) start(runtime *gatewayRuntime) {
 	runtime.cancel = cancel
 	runtime.gateway.StartProxyHealthChecks(runtimeCtx)
 	runtime.gateway.StartModelRefresh(runtimeCtx)
+	runtime.gateway.StartExitProbes(runtimeCtx)
 }
 
 // Handler returns the API handler, wrapped in the telemetry middleware. Each

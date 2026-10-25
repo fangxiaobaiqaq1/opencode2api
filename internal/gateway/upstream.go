@@ -1046,8 +1046,22 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 	status := upstreamStatus(resp)
 	g.syncProxyResult(ctx, node.proxy, status, err)
 	if err == nil && status/100 == 2 {
+		wasVerified := node.verified.Load()
 		g.anonymous.MarkSuccess(node)
 		g.anonymous.NoteSuccess()
+		if !wasVerified && g.anonymous.quotaStrikes > 0 {
+			g.saveExitQuota()
+		}
+	} else if err == nil && peekFreeUsageLimit(resp) {
+		// The exit's daily allowance is used up (counted per egress IP per
+		// UTC day). That says nothing about the lane, so it never trips the
+		// breaker; the exit itself cools until UTC midnight once the strikes
+		// reach performance.quota_strikes.
+		if g.anonymous.MarkQuotaExhausted(node, false) {
+			g.logger.Info("exit daily free quota exhausted; cooling until UTC midnight", "component", "upstream", "event", "exit_quota_exhausted", "proxy", config.RedactURL(node.proxy.name), "cool_for", utcMidnightDelay(time.Now()).Round(time.Minute).String())
+			g.saveExitQuota()
+		}
+		g.anonymous.NoteNeutral()
 	} else {
 		g.anonymous.MarkFailure(node, resp, err)
 		if resp != nil && peekNetworkAbuseBlock(resp) {

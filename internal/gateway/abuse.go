@@ -92,6 +92,30 @@ func peekResponseBody(resp *http.Response) []byte {
 	return prefix
 }
 
+// errQuotaExhausted marks an exit whose daily free allowance is used up (a
+// FreeUsageLimit 429). OpenCode counts that allowance per egress IP per UTC
+// day, so another exit can still serve the request.
+var errQuotaExhausted = errors.New("free tier daily quota exhausted on this exit")
+
+// isFreeUsageLimit reports whether status and body are OpenCode's per-IP
+// daily free quota rejection (console ipRateLimiter: FreeUsageLimitError,
+// "Free usage limit reached"), as opposed to a transient provider 429.
+func isFreeUsageLimit(status int, body []byte) bool {
+	if status != http.StatusTooManyRequests {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "freeusagelimit") || strings.Contains(text, "free usage limit")
+}
+
+// peekFreeUsageLimit classifies a response without consuming its body.
+func peekFreeUsageLimit(resp *http.Response) bool {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+	return isFreeUsageLimit(resp.StatusCode, peekResponseBody(resp))
+}
+
 // peekNetworkAbuseBlock classifies a response without consuming its body.
 func peekNetworkAbuseBlock(resp *http.Response) bool {
 	if resp == nil || resp.StatusCode != http.StatusForbidden {

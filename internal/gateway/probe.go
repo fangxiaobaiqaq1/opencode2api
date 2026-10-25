@@ -23,8 +23,11 @@ import (
 // "zen") that produced it, and the effort observation to store.
 type probeResult struct {
 	success, attempted, effortRejected bool
-	reason, channel                    string
-	effort                             models.EffortProbe
+	// quota reports a FreeUsageLimit 429: the probing exit's daily allowance
+	// is used up, which says nothing about the model.
+	quota           bool
+	reason, channel string
+	effort          models.EffortProbe
 }
 
 // resolvedEffort returns the reasoning effort to force on a request for model:
@@ -252,6 +255,9 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 			// reading another anonymous "http_403".
 			if isNetworkAbuseBlock(resp.StatusCode, body) {
 				return probeResult{attempted: true, reason: "network_abuse_blocked"}
+			}
+			if isFreeUsageLimit(resp.StatusCode, body) {
+				return probeResult{attempted: true, reason: "free_usage_limit", quota: true}
 			}
 			result.effortRejected = isEffortRejection(resp.StatusCode, string(body))
 			if isModelUnavailable(resp.StatusCode, string(body)) {
