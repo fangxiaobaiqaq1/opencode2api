@@ -50,6 +50,32 @@ type registrar struct {
 	minGap  time.Duration
 	mu      sync.Mutex
 	lastReg time.Time
+	// source (fork), when valid, makes every registration leave from a fresh
+	// address drawn from this IPv6 prefix. Cloudflare rate-limits /reg per
+	// source IP (HTTP 429 "error code: 1015"); a fresh /64 answers 200.
+	source netip.Prefix
+}
+
+// clientFor returns the HTTP client for one registration: a dedicated client
+// bound to a random source from r.source (IPV6_FREEBIND), or the shared one.
+func (r *registrar) clientFor() *http.Client {
+	if !r.source.IsValid() {
+		return r.client
+	}
+	src, err := randomSource(r.source)
+	if err != nil {
+		return r.client
+	}
+	dialer := &net.Dialer{Timeout: 15 * time.Second, LocalAddr: &net.TCPAddr{IP: net.IP(src.AsSlice())}, Control: freebindControl}
+	return &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp6", address)
+		},
+		ForceAttemptHTTP2:   false,
+		DisableKeepAlives:   true,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}}
 }
 
 func newRegistrar() *registrar {
@@ -90,6 +116,7 @@ func (r *registrar) register(ctx context.Context) (registration, error) {
 		}
 	}
 
+	client := r.clientFor()
 	privateKey, publicKey, err := wireGuardKeypair()
 	if err != nil {
 		return registration{}, err
@@ -108,7 +135,7 @@ func (r *registrar) register(ctx context.Context) (registration, error) {
 		return registration{}, err
 	}
 	var created deviceEnvelope
-	if err := r.doJSON(ctx, http.MethodPost, "/reg", payload, "", &created); err != nil {
+	if err := r.doJSON(ctx, client, http.MethodPost, "/reg", payload, "", &created); err != nil {
 		return registration{}, fmt.Errorf("create WARP device: %w", err)
 	}
 	if created.Result.ID == "" || created.Result.Token == "" {
@@ -120,11 +147,11 @@ func (r *registrar) register(ctx context.Context) (registration, error) {
 		return registration{}, err
 	}
 	var patched deviceEnvelope
-	if err := r.doJSON(ctx, http.MethodPatch, "/reg/"+created.Result.ID, enabled, created.Result.Token, &patched); err != nil {
+	if err := r.doJSON(ctx, client, http.MethodPatch, "/reg/"+created.Result.ID, enabled, created.Result.Token, &patched); err != nil {
 		return registration{}, fmt.Errorf("enable WARP device: %w", err)
 	}
 	var current deviceEnvelope
-	if err := r.doJSON(ctx, http.MethodGet, "/reg/"+created.Result.ID, nil, created.Result.Token, &current); err != nil {
+	if err := r.doJSON(ctx, client, http.MethodGet, "/reg/"+created.Result.ID, nil, created.Result.Token, &current); err != nil {
 		return registration{}, fmt.Errorf("read WARP device: %w", err)
 	}
 	if !current.Result.WARPEnabled {
@@ -206,7 +233,7 @@ func uniqueEndpoints(endpoints []string) []string {
 	return result
 }
 
-func (r *registrar) doJSON(ctx context.Context, method, path string, body []byte, token string, target any) error {
+func (r *registrar) doJSON(ctx context.Context, client *http.Client, method, path string, body []byte, token string, target any) error {
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 0 {
@@ -233,7 +260,7 @@ func (r *registrar) doJSON(ctx context.Context, method, path string, body []byte
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
-		resp, err := r.client.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
 			continue

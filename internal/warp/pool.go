@@ -151,6 +151,9 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 	if opts.RegisterGap > 0 {
 		r.minGap = opts.RegisterGap
 	}
+	if opts.SourceIPv6.IsValid() {
+		r.source = opts.SourceIPv6 // fork: registrations rotate their source too
+	}
 	pool, err := newPool(ctx, slogLogger{log: log}, size, func(ctx context.Context) (*exit, error) {
 		reg, err := r.register(ctx)
 		if err != nil {
